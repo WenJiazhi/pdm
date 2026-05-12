@@ -1,0 +1,46 @@
+# Build artifacts
+build*/
+dist/
+release/
+release_build/
+*.exe
+!tools/aria2c.exe
+
+# Python cache
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller
+*.spec.bak
+
+# Logs and local runtime state
+*.log
+.bduss_downloader/
+.pdm/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+ehthumbs.db
+
+# Claude Code
+.claude/
