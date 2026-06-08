@@ -6,9 +6,10 @@ import os
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QGroupBox, QTreeWidget, QTreeWidgetItem,
-    QHeaderView, QAbstractItemView,
+    QHeaderView, QAbstractItemView, QPlainTextEdit,
 )
 from PyQt5.QtCore import pyqtSignal, Qt, QThread, pyqtSlot
+from PyQt5.QtGui import QBrush, QColor
 
 
 ACCOUNTS_PATH = os.path.join(
@@ -91,14 +92,16 @@ class LoginTab(QWidget):
         self.config = config
         self._worker = None
         self._pending_cookie = None
-        self._active_username = ""
         self._accounts = _load_accounts()
+        self._active_username = self._infer_active_username()
+        if self._active_username:
+            self._promote_account_to_top(self._active_username, persist=True)
         self._init_ui()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(60, 40, 60, 30)
-        layout.setSpacing(16)
+        layout.setContentsMargins(34, 24, 34, 20)
+        layout.setSpacing(12)
 
         title = QLabel("PDM")
         title.setObjectName("lblTitle")
@@ -118,17 +121,39 @@ class LoginTab(QWidget):
         login_layout.setContentsMargins(18, 24, 18, 18)
         login_layout.setSpacing(10)
 
-        self.btn_browser_login = QPushButton("浏览器登录（推荐）")
+        self.btn_browser_login = QPushButton("网页登录（推荐）")
         self.btn_browser_login.setMinimumHeight(44)
         self.btn_browser_login.clicked.connect(self._do_browser_login)
         login_layout.addWidget(self.btn_browser_login)
 
-        lbl_hint = QLabel("点击后会打开百度网盘登录页面，登录成功后自动保存账号")
+        lbl_hint = QLabel("优先使用内嵌登录窗口，登录成功后自动保存账号")
         lbl_hint.setStyleSheet("color: #94A3B8; font-size: 11px;")
         lbl_hint.setAlignment(Qt.AlignCenter)
         login_layout.addWidget(lbl_hint)
 
         layout.addWidget(login_group)
+
+        # ── 手动 Cookie 导入 ──
+        cookie_group = QGroupBox("手动 Cookie 导入")
+        cookie_layout = QVBoxLayout(cookie_group)
+        cookie_layout.setContentsMargins(18, 24, 18, 18)
+        cookie_layout.setSpacing(10)
+
+        self.edit_cookie = QPlainTextEdit()
+        self.edit_cookie.setPlaceholderText("粘贴新的 Cookie 后点击导入，不会显示已保存 Cookie")
+        self.edit_cookie.setFixedHeight(76)
+        cookie_layout.addWidget(self.edit_cookie)
+
+        cookie_btn_layout = QHBoxLayout()
+        cookie_btn_layout.addStretch()
+        self.btn_import_cookie = QPushButton("导入 Cookie")
+        self.btn_import_cookie.setMinimumHeight(34)
+        self.btn_import_cookie.setObjectName("btnFlat")
+        self.btn_import_cookie.clicked.connect(self._import_cookie)
+        cookie_btn_layout.addWidget(self.btn_import_cookie)
+        cookie_layout.addLayout(cookie_btn_layout)
+
+        layout.addWidget(cookie_group)
 
         # ── 已保存账号列表 ──
         account_group = QGroupBox("已保存的账号")
@@ -144,6 +169,7 @@ class LoginTab(QWidget):
         self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tree.setAllColumnsShowFocus(True)
+        self.tree.setMinimumHeight(120)
 
         header = self.tree.header()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
@@ -191,20 +217,35 @@ class LoginTab(QWidget):
 
     def _refresh_account_list(self):
         self.tree.clear()
+        active_item = None
         for acc in self._accounts:
+            is_active = acc.get("username") == self._active_username
             item = QTreeWidgetItem([
                 acc.get("username", "未知"),
                 acc.get("vip_type", "未知"),
-                "已登录" if acc.get("username") == self._active_username else "已保存",
+                "当前使用" if is_active else "已保存",
             ])
             item.setData(0, Qt.UserRole, acc)
+            if is_active:
+                active_item = item
+                active_bg = QBrush(QColor("#EFF6FF"))
+                active_fg = QBrush(QColor("#1D4ED8"))
+                for column in range(3):
+                    item.setBackground(column, active_bg)
+                item.setForeground(0, active_fg)
+                item.setForeground(2, active_fg)
             self.tree.addTopLevelItem(item)
+        if active_item:
+            self.tree.setCurrentItem(active_item)
+            active_item.setSelected(True)
+            self.tree.scrollToItem(active_item)
         self._sync_account_buttons()
 
     def _sync_account_buttons(self):
         has_selection = self._get_selected_account() is not None
         busy = bool(self._worker and self._worker.isRunning())
         self.btn_browser_login.setEnabled(not busy)
+        self.btn_import_cookie.setEnabled(not busy)
         self.btn_login_selected.setEnabled(has_selection and not busy)
         self.btn_delete_selected.setEnabled(has_selection and not busy)
 
@@ -239,6 +280,20 @@ class LoginTab(QWidget):
             return
 
         self.lbl_status.setText("正在登录...")
+        self.lbl_status.setStyleSheet("color: #F59E0B;")
+
+        self._pending_cookie = cookie
+        self._start_login_worker(LoginWorker(self.api, cookie_string=cookie))
+
+    def _import_cookie(self):
+        cookie = self.edit_cookie.toPlainText().strip()
+        if not cookie:
+            self.lbl_status.setText("请先粘贴 Cookie")
+            self.lbl_status.setStyleSheet("color: #EF4444;")
+            return
+
+        self.edit_cookie.clear()
+        self.lbl_status.setText("正在验证 Cookie...")
         self.lbl_status.setStyleSheet("color: #F59E0B;")
 
         self._pending_cookie = cookie
@@ -293,6 +348,7 @@ class LoginTab(QWidget):
                 cookie = "; ".join(parts)
 
             self._save_account(msg, vip_type, cookie)
+            self._promote_account_to_top(msg, persist=True)
             self._pending_cookie = None
 
             self.config["full_cookie"] = cookie
@@ -306,7 +362,7 @@ class LoginTab(QWidget):
                 item = self.tree.topLevelItem(i)
                 acc = item.data(0, Qt.UserRole)
                 if acc and acc.get("username") == msg:
-                    item.setText(2, "已登录")
+                    item.setText(2, "当前使用")
                     self.tree.setCurrentItem(item)
                     item.setSelected(True)
                     self.tree.scrollToItem(item)
@@ -316,20 +372,52 @@ class LoginTab(QWidget):
             self._pending_cookie = None
 
     def _save_account(self, username: str, vip_type: str, cookie: str):
-        found = False
-        for acc in self._accounts:
-            if acc.get("username") == username:
-                acc["cookie"] = cookie
-                acc["vip_type"] = vip_type
-                found = True
-                break
-        if not found:
-            self._accounts.append({
-                "username": username,
-                "vip_type": vip_type,
-                "cookie": cookie,
-            })
+        existing = next(
+            (acc for acc in self._accounts if acc.get("username") == username),
+            {},
+        )
+        record = {
+            **existing,
+            "username": username,
+            "vip_type": vip_type,
+            "cookie": cookie,
+        }
+        self._accounts = [
+            acc for acc in self._accounts if acc.get("username") != username
+        ]
+        self._accounts.insert(0, record)
         _save_accounts(self._accounts)
+
+    def _promote_account_to_top(self, username: str, persist: bool):
+        if not username:
+            return
+        for index, acc in enumerate(self._accounts):
+            if acc.get("username") == username:
+                if index > 0:
+                    self._accounts.insert(0, self._accounts.pop(index))
+                    if persist:
+                        _save_accounts(self._accounts)
+                return
+
+    def _infer_active_username(self) -> str:
+        cookie = self.config.get("full_cookie", "")
+        bduss = self.config.get("bduss", "") or self._cookie_value(cookie, "BDUSS")
+        for acc in self._accounts:
+            acc_cookie = acc.get("cookie", "")
+            if cookie and acc_cookie == cookie:
+                return acc.get("username", "")
+            if bduss and self._cookie_value(acc_cookie, "BDUSS") == bduss:
+                return acc.get("username", "")
+        return ""
+
+    @staticmethod
+    def _cookie_value(cookie: str, name: str) -> str:
+        prefix = f"{name}="
+        for part in cookie.split(";"):
+            part = part.strip()
+            if part.startswith(prefix):
+                return part[len(prefix):]
+        return ""
 
     def _do_logout(self):
         self.api.update_credentials("", "")
@@ -337,9 +425,7 @@ class LoginTab(QWidget):
         self.btn_logout.setEnabled(False)
         self.lbl_status.setText("已退出登录")
         self.lbl_status.setStyleSheet("color: #A1A1AA;")
-        for i in range(self.tree.topLevelItemCount()):
-            item = self.tree.topLevelItem(i)
-            item.setText(2, "已保存")
+        self._refresh_account_list()
         self.tree.clearSelection()
         self.logout_success.emit()
 

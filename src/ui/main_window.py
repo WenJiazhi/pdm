@@ -23,8 +23,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PDM")
-        self.setMinimumSize(1080, 720)
-        self.resize(1180, 780)
+        self.setMinimumSize(760, 500)
+        self.resize(1040, 680)
 
         self.config = load_config()
         self.api = BaiduPanAPI(
@@ -67,15 +67,15 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         root = QHBoxLayout(central)
-        root.setContentsMargins(12, 12, 12, 10)
-        root.setSpacing(12)
+        root.setContentsMargins(10, 10, 10, 8)
+        root.setSpacing(10)
 
         self.sidebar = QFrame()
         self.sidebar.setObjectName("sidebar")
-        self.sidebar.setFixedWidth(200)
+        self.sidebar.setFixedWidth(168)
         side_layout = QVBoxLayout(self.sidebar)
         side_layout.setContentsMargins(12, 16, 12, 12)
-        side_layout.setSpacing(4)
+        side_layout.setSpacing(2)
 
         brand = QLabel("PDM")
         brand.setObjectName("brandTitle")
@@ -127,7 +127,7 @@ class MainWindow(QMainWindow):
         content_frame = QFrame()
         content_frame.setObjectName("contentFrame")
         content_layout = QVBoxLayout(content_frame)
-        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setContentsMargins(2, 2, 2, 2)
         content_layout.addWidget(self.stack)
 
         root.addWidget(self.sidebar)

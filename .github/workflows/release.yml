@@ -1,0 +1,53 @@
+name: Build release artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build Windows zip
+        shell: pwsh
+        run: ./script/package_windows.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PDM-windows-x64
+          path: |
+            release/windows/PDM-windows-x64.zip
+            release/windows/checksums.txt
+
+  macos:
+    name: macOS universal
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build macOS DMG
+        run: |
+          chmod +x script/package_dmg.sh
+          chmod +x tools/macos/aria2/aria2c
+          ./script/package_dmg.sh
+          mkdir -p release/macos
+          cp dist-macos/PDM-macOS.dmg release/macos/
+          (cd release/macos && shasum -a 256 PDM-macOS.dmg > checksums.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PDM-macOS
+          path: |
+            release/macos/PDM-macOS.dmg
+            release/macos/checksums.txt

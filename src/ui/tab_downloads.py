@@ -22,33 +22,40 @@ class DownloadsTab(QWidget):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
 
         # 顶部按钮
         top_layout = QHBoxLayout()
-        top_layout.setSpacing(10)
+        top_layout.setSpacing(8)
         self.lbl_summary = QLabel("暂无下载任务")
         self.lbl_summary.setStyleSheet("font-size: 13px; color: #64748B;")
         top_layout.addWidget(self.lbl_summary, 1)
 
         self.btn_pause_all = QPushButton("全部暂停")
-        self.btn_pause_all.setMinimumHeight(32)
+        self.btn_pause_all.setMinimumHeight(30)
         self.btn_pause_all.setObjectName("btnWarning")
         self.btn_pause_all.clicked.connect(self._pause_all)
 
         self.btn_resume_all = QPushButton("全部恢复")
-        self.btn_resume_all.setMinimumHeight(32)
+        self.btn_resume_all.setMinimumHeight(30)
         self.btn_resume_all.setObjectName("btnSuccess")
         self.btn_resume_all.clicked.connect(self._resume_all)
 
+        self.btn_remove_selected = QPushButton("移除所选")
+        self.btn_remove_selected.setMinimumHeight(30)
+        self.btn_remove_selected.setObjectName("btnFlat")
+        self.btn_remove_selected.clicked.connect(self._remove_selected)
+        self.btn_remove_selected.setEnabled(False)
+
         self.btn_clear_completed = QPushButton("清除已完成")
-        self.btn_clear_completed.setMinimumHeight(32)
+        self.btn_clear_completed.setMinimumHeight(30)
         self.btn_clear_completed.setObjectName("btnFlat")
         self.btn_clear_completed.clicked.connect(self._clear_completed)
 
         top_layout.addWidget(self.btn_pause_all)
         top_layout.addWidget(self.btn_resume_all)
+        top_layout.addWidget(self.btn_remove_selected)
         top_layout.addWidget(self.btn_clear_completed)
 
         layout.addLayout(top_layout)
@@ -61,21 +68,23 @@ class DownloadsTab(QWidget):
         )
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
+        self.table.itemSelectionChanged.connect(self._sync_actions)
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.Fixed)
-        header.resizeSection(2, 200)
+        header.resizeSection(2, 160)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
 
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(42)
+        self.table.verticalHeader().setDefaultSectionSize(36)
 
         layout.addWidget(self.table, 1)
 
@@ -97,6 +106,10 @@ class DownloadsTab(QWidget):
 
         # 调整行数
         self.table.setRowCount(len(tasks))
+        active_task_ids = {task.task_id for task in tasks}
+        for task_id in list(self._progress_bars):
+            if task_id not in active_task_ids:
+                del self._progress_bars[task_id]
 
         for row, task in enumerate(tasks):
             # 文件名
@@ -157,6 +170,24 @@ class DownloadsTab(QWidget):
             from PyQt5.QtGui import QColor
             status_item.setForeground(QColor(status_color))
             self.table.setItem(row, 5, status_item)
+        self._sync_actions()
+
+    def _selected_task_ids(self) -> list[str]:
+        task_ids = []
+        seen = set()
+        for item in self.table.selectedItems():
+            row = item.row()
+            name_item = self.table.item(row, 0)
+            if not name_item:
+                continue
+            task_id = name_item.data(Qt.UserRole)
+            if task_id and task_id not in seen:
+                seen.add(task_id)
+                task_ids.append(task_id)
+        return task_ids
+
+    def _sync_actions(self):
+        self.btn_remove_selected.setEnabled(bool(self._selected_task_ids()))
 
     def _show_context_menu(self, pos):
         row = self.table.currentRow()
@@ -195,6 +226,14 @@ class DownloadsTab(QWidget):
         self.dm.remove_task(task_id)
         if task_id in self._progress_bars:
             del self._progress_bars[task_id]
+        self._refresh_table()
+
+    def _remove_selected(self):
+        for task_id in self._selected_task_ids():
+            self.dm.remove_task(task_id)
+            if task_id in self._progress_bars:
+                del self._progress_bars[task_id]
+        self._refresh_table()
 
     def _pause_all(self):
         for task in self.dm.get_tasks():
@@ -212,3 +251,4 @@ class DownloadsTab(QWidget):
                 self.dm.remove_task(task.task_id)
                 if task.task_id in self._progress_bars:
                     del self._progress_bars[task.task_id]
+        self._refresh_table()

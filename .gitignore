@@ -1,10 +1,16 @@
 # Build artifacts
 build*/
 dist/
+dist-macos/
 release/
 release_build/
 *.exe
+*.zip
+*.dmg
 !tools/aria2c.exe
+
+# SwiftPM
+macos/.build/
 
 # Python cache
 **/__pycache__/
@@ -27,6 +33,7 @@ env/
 *.log
 .bduss_downloader/
 .pdm/
+local-import/
 
 # IDE
 .vscode/
@@ -44,3 +51,6 @@ ehthumbs.db
 
 # Claude Code
 .claude/
+
+# Codex local workspace config
+.codex/

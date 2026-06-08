@@ -18,9 +18,11 @@ from typing import Optional, Callable
 import requests
 
 from .api import BaiduPanAPI
+from .config import APP_DIR
 from .logger import get_logger
 
 logger = get_logger()
+DOWNLOADS_PATH = os.path.join(APP_DIR, "downloads.json")
 
 
 class DownloadStatus(Enum):
@@ -46,7 +48,21 @@ class DownloadTask:
     custom_headers: dict = field(default_factory=dict)
     aria2_gid: str = ""  # aria2 download GID
     connections: int = 0  # 当前连接数
+    pan_path: str = ""
+    expected_size: int = 0
+    retry_count: int = 0
+    updated_at: float = field(default_factory=time.time)
     _finish_event: threading.Event = field(default_factory=threading.Event, repr=False)
+
+    def __post_init__(self):
+        # Backward-compatible attribute names used by older retry paths.
+        self._pan_path = self.pan_path
+        self._expected_size = self.expected_size or self.total_size
+        self._retry_count = self.retry_count
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in (DownloadStatus.COMPLETED, DownloadStatus.ERROR)
 
 
 def _find_aria2c() -> str:
@@ -113,9 +129,12 @@ class DownloadManager:
             "status_changed": [],
             "speed_update": [],
         }
+        self._last_persist_time = 0.0
 
         # 任务提交队列（提交给 aria2 后由 aria2 控制并发数）
         self._submit_queue: queue.Queue[DownloadTask] = queue.Queue()
+
+        self._load_persisted_tasks()
 
         # 启动 aria2c RPC 服务（后台线程，不阻塞GUI）
         self._aria2_init_thread = threading.Thread(target=self._start_aria2c, daemon=True)
@@ -260,6 +279,114 @@ class DownloadManager:
                 cb(*args)
             except Exception:
                 pass
+        if event == "status_changed":
+            self._persist_tasks(force=True)
+        elif event in ("progress", "speed_update"):
+            self._persist_tasks(force=False)
+
+    def _task_to_record(self, task: DownloadTask) -> dict:
+        return {
+            "task_id": task.task_id,
+            "filename": task.filename,
+            "fs_id": task.fs_id,
+            "dlink": task.dlink,
+            "save_path": task.save_path,
+            "total_size": int(task.total_size or 0),
+            "downloaded_size": int(task.downloaded_size or 0),
+            "status": task.status.value,
+            "error_msg": task.error_msg,
+            "custom_headers": task.custom_headers,
+            "pan_path": getattr(task, "_pan_path", task.pan_path),
+            "expected_size": int(getattr(task, "_expected_size", task.expected_size or task.total_size or 0)),
+            "retry_count": int(getattr(task, "_retry_count", task.retry_count or 0)),
+            "connections": int(task.connections or 0),
+            "updated_at": time.time(),
+        }
+
+    def _record_to_task(self, record: dict) -> Optional[DownloadTask]:
+        try:
+            status = DownloadStatus(record.get("status", DownloadStatus.PAUSED.value))
+        except ValueError:
+            status = DownloadStatus.ERROR
+        if status in (DownloadStatus.DOWNLOADING, DownloadStatus.WAITING):
+            status = DownloadStatus.PAUSED
+
+        save_path = record.get("save_path", "")
+        downloaded_size = int(record.get("downloaded_size") or 0)
+        if status in (DownloadStatus.PAUSED, DownloadStatus.ERROR):
+            downloaded_size = max(downloaded_size, self._file_size(save_path))
+        elif status == DownloadStatus.COMPLETED and os.path.exists(save_path):
+            downloaded_size = max(downloaded_size, self._file_size(save_path))
+
+        task = DownloadTask(
+            task_id=record.get("task_id") or f"restored_{uuid.uuid4().hex}",
+            filename=record.get("filename") or os.path.basename(save_path) or "download",
+            fs_id=int(record.get("fs_id") or 0),
+            dlink=record.get("dlink") or "",
+            save_path=save_path,
+            total_size=int(record.get("total_size") or record.get("expected_size") or 0),
+            downloaded_size=downloaded_size,
+            status=status,
+            speed=0.0,
+            error_msg=record.get("error_msg", ""),
+            custom_headers=record.get("custom_headers") or {},
+            connections=int(record.get("connections") or 0),
+            pan_path=record.get("pan_path", ""),
+            expected_size=int(record.get("expected_size") or record.get("total_size") or 0),
+            retry_count=int(record.get("retry_count") or 0),
+            updated_at=float(record.get("updated_at") or time.time()),
+        )
+        task.aria2_gid = ""
+        return task
+
+    def _load_persisted_tasks(self):
+        if not os.path.exists(DOWNLOADS_PATH):
+            return
+        try:
+            with open(DOWNLOADS_PATH, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except Exception as e:
+            logger.warning(f" failed to load download records: {e}")
+            return
+        if not isinstance(records, list):
+            return
+        with self._lock:
+            for record in records:
+                task = self._record_to_task(record)
+                if not task or task.task_id in self._tasks:
+                    continue
+                self._tasks[task.task_id] = task
+                self._task_order.append(task.task_id)
+        logger.info(f" restored {len(self._task_order)} download tasks")
+
+    def _persist_tasks(self, force: bool = False):
+        now = time.time()
+        if not force and now - self._last_persist_time < 1.0:
+            return
+        self._last_persist_time = now
+        try:
+            os.makedirs(os.path.dirname(DOWNLOADS_PATH), exist_ok=True)
+            with self._lock:
+                records = [
+                    self._task_to_record(self._tasks[tid])
+                    for tid in self._task_order
+                    if tid in self._tasks
+                ]
+            tmp_path = DOWNLOADS_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(records, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, DOWNLOADS_PATH)
+        except Exception as e:
+            logger.warning(f" failed to save download records: {e}")
+
+    def _file_size(self, path: str) -> int:
+        try:
+            return os.path.getsize(path) if path and os.path.exists(path) else 0
+        except OSError:
+            return 0
+
+    def save_now(self):
+        self._persist_tasks(force=True)
 
     # ─── 任务管理 ──────────────────────────────────────────────
 
@@ -280,6 +407,8 @@ class DownloadManager:
             save_path=save_path,
             total_size=total_size,
             custom_headers=headers or {},
+            pan_path=file_path or "",
+            expected_size=total_size,
         )
         # 存储文件在网盘中的路径，PCS API需要
         task._pan_path = file_path
@@ -514,6 +643,7 @@ class DownloadManager:
 
             with self._lock:
                 self._gid_to_task[task.aria2_gid] = task.task_id
+            self._emit("status_changed", task.task_id, DownloadStatus.DOWNLOADING)
 
         except Exception as e:
             task.status = DownloadStatus.ERROR
@@ -544,11 +674,16 @@ class DownloadManager:
                 except Exception:
                     pass
 
-        # 清理aria2控制文件
+        # 用户主动移除未完成任务时清理本地半成品；已完成任务只移除记录。
         if task:
             task._finish_event.set()
             aria2_ctrl = task.save_path + ".aria2"
-            if os.path.exists(aria2_ctrl):
+            if task.status != DownloadStatus.COMPLETED and os.path.exists(task.save_path):
+                try:
+                    os.remove(task.save_path)
+                except Exception:
+                    pass
+            if task.status != DownloadStatus.COMPLETED and os.path.exists(aria2_ctrl):
                 try:
                     os.remove(aria2_ctrl)
                 except Exception:
@@ -590,8 +725,11 @@ class DownloadManager:
         if task.status in (DownloadStatus.PAUSED, DownloadStatus.ERROR):
             task.error_msg = ""
             task.speed = 0
-            task.downloaded_size = 0
+            task.downloaded_size = self._file_size(task.save_path)
             task.connections = 0
+            if task.aria2_gid:
+                with self._lock:
+                    self._gid_to_task.pop(task.aria2_gid, None)
             task.aria2_gid = ""
             task._finish_event.clear()
             task.status = DownloadStatus.WAITING
@@ -648,16 +786,19 @@ class DownloadManager:
                             retry_count = getattr(task, '_retry_count', 0)
                             pan_path = getattr(task, '_pan_path', '')
                             logger.debug(f" Size mismatch: got {total} vs expected {expected}, retrying...")
+                            with self._lock:
+                                self._gid_to_task.pop(gid, None)
                             if pan_path and retry_count < self.MAX_RETRIES:
                                 task._retry_count = retry_count + 1
+                                task.retry_count = task._retry_count
                                 task.downloaded_size = 0
                                 task.speed = 0
-                                with self._lock:
-                                    self._gid_to_task.pop(gid, None)
-                                # 删除错误文件
                                 try:
                                     if os.path.exists(task.save_path):
                                         os.remove(task.save_path)
+                                    aria2_ctrl = task.save_path + ".aria2"
+                                    if os.path.exists(aria2_ctrl):
+                                        os.remove(aria2_ctrl)
                                 except Exception:
                                     pass
                                 t = threading.Thread(
@@ -685,20 +826,12 @@ class DownloadManager:
                         # 所有错误都尝试重试（不只是403），直到用完重试次数
                         if pan_path and retry_count < self.MAX_RETRIES:
                             task._retry_count = retry_count + 1
+                            task.retry_count = task._retry_count
                             logger.debug(f" aria2 error, retry {task._retry_count}/{self.MAX_RETRIES}...")
-                            task.downloaded_size = 0
+                            task.downloaded_size = self._file_size(task.save_path)
                             task.speed = 0
                             with self._lock:
                                 self._gid_to_task.pop(gid, None)
-                            # 删除可能的部分文件，让 aria2 重新开始
-                            try:
-                                if os.path.exists(task.save_path):
-                                    os.remove(task.save_path)
-                                aria2_ctrl = task.save_path + ".aria2"
-                                if os.path.exists(aria2_ctrl):
-                                    os.remove(aria2_ctrl)
-                            except Exception:
-                                pass
                             t = threading.Thread(
                                 target=self._retry_with_pcs, args=(task,), daemon=True
                             )
@@ -706,11 +839,12 @@ class DownloadManager:
                         elif pan_path and retry_count >= self.MAX_RETRIES:
                             # 重试次数用完，尝试 fallback
                             logger.debug(f" Retries exhausted, trying fallback session download...")
-                            task.downloaded_size = 0
+                            task.downloaded_size = self._file_size(task.save_path)
                             task.speed = 0
                             with self._lock:
                                 self._gid_to_task.pop(gid, None)
                             task._retry_count = retry_count + 1  # 防止重复进入
+                            task.retry_count = task._retry_count
                             t = threading.Thread(
                                 target=self._fallback_download, args=(task,), daemon=True
                             )
@@ -775,6 +909,7 @@ class DownloadManager:
                     logger.debug(f" locatedownload retry submitted, gid={result}")
                     with self._lock:
                         self._gid_to_task[task.aria2_gid] = task.task_id
+                    self._emit("status_changed", task.task_id, DownloadStatus.DOWNLOADING)
                     return
 
             # 回退到 PCS download API
@@ -831,10 +966,11 @@ class DownloadManager:
             logger.debug(f" PCS retry submitted, gid={result}")
             with self._lock:
                 self._gid_to_task[task.aria2_gid] = task.task_id
+            self._emit("status_changed", task.task_id, DownloadStatus.DOWNLOADING)
 
         except Exception as e:
             logger.debug(f" PCS retry failed: {e}, trying fallback...")
-            task.downloaded_size = 0
+            task.downloaded_size = self._file_size(task.save_path)
             t = threading.Thread(
                 target=self._fallback_download, args=(task,), daemon=True
             )
@@ -850,17 +986,46 @@ class DownloadManager:
 
             os.makedirs(os.path.dirname(task.save_path), exist_ok=True)
 
+            existing_size = self._file_size(task.save_path)
+            headers = {"Referer": "https://pan.baidu.com/disk/home"}
+            if existing_size > 0:
+                headers["Range"] = f"bytes={existing_size}-"
+
             # 使用 api.session 下载（带完整cookie，自动跟随重定向）
             resp = self.api.session.get(
                 task.dlink,
-                headers={"Referer": "https://pan.baidu.com/disk/home"},
+                headers=headers,
                 stream=True,
                 allow_redirects=True,
                 timeout=60,
             )
 
-            if task.total_size == 0:
-                task.total_size = int(resp.headers.get("Content-Length", 0))
+            append_mode = False
+            if resp.status_code == 206:
+                append_mode = existing_size > 0
+                task.downloaded_size = existing_size
+                content_range = resp.headers.get("Content-Range", "")
+                if "/" in content_range:
+                    total_part = content_range.rsplit("/", 1)[-1]
+                    if total_part.isdigit():
+                        task.total_size = int(total_part)
+                if task.total_size == 0:
+                    task.total_size = existing_size + int(resp.headers.get("Content-Length", 0))
+            elif resp.status_code == 416 and existing_size > 0:
+                expected = getattr(task, "_expected_size", task.total_size)
+                if expected <= 0 or existing_size >= expected:
+                    task.downloaded_size = existing_size
+                    task.total_size = max(task.total_size, existing_size)
+                    task.status = DownloadStatus.COMPLETED
+                    task.speed = 0
+                    self._emit("status_changed", task.task_id, DownloadStatus.COMPLETED)
+                    task._finish_event.set()
+                    resp.close()
+                    return
+            else:
+                task.downloaded_size = 0
+                if task.total_size == 0:
+                    task.total_size = int(resp.headers.get("Content-Length", 0))
 
             logger.debug(f" Fallback download: status={resp.status_code}, "
                   f"CL={resp.headers.get('Content-Length','?')}, "
@@ -886,14 +1051,15 @@ class DownloadManager:
                     )
                 raise Exception(f"下载被拒绝(403)")
 
-            if resp.status_code != 200:
+            if resp.status_code not in (200, 206):
                 raise Exception(f"下载失败, HTTP {resp.status_code}")
 
             chunk_size = 64 * 1024
             last_time = time.time()
-            last_downloaded = 0
+            last_downloaded = task.downloaded_size
 
-            with open(task.save_path, "wb") as f:
+            mode = "ab" if append_mode else "wb"
+            with open(task.save_path, mode) as f:
                 for chunk in resp.iter_content(chunk_size=chunk_size):
                     if task.status != DownloadStatus.DOWNLOADING:
                         return
@@ -954,6 +1120,7 @@ class DownloadManager:
 
     def stop(self):
         """停止下载管理器和 aria2c 进程"""
+        self.save_now()
         self._running = False
         if self._aria2_ready:
             try:

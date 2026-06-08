@@ -359,7 +359,11 @@ class BaiduPanAPI:
 
     def transfer_share_files(self, surl: str, from_fs_ids: list,
                               to_path: str = "/", randsk: str = "") -> dict:
-        """转存分享文件到自己的网盘"""
+        """转存分享文件到自己的网盘。
+
+        百度的分享转存接口对 sekey、BDCLND、Referer 和 bdstoken 很敏感。
+        这里按 macOS 端相同策略尝试几种等价请求，避免 errno=2 只能靠用户反复点击。
+        """
         self._fetch_bdstoken()
         page_info = self.get_share_page_info(surl)
 
@@ -369,26 +373,101 @@ class BaiduPanAPI:
         if not shareid or not uk:
             return {"errno": -1, "errmsg": "无法提取 shareid/uk"}
 
+        decoded_randsk = unquote(randsk or "")
+        original_randsk = randsk or decoded_randsk
+        active_bdclnd = original_randsk or decoded_randsk
+        if active_bdclnd:
+            self.session.cookies.set("BDCLND", active_bdclnd, domain=".baidu.com", path="/")
+
         url = f"{self.BASE}/share/transfer"
-        params = {
+        base_params = {
             "shareid": shareid,
             "from": uk,
             "channel": "chunlei",
             "web": 1,
             "clienttype": 0,
         }
-        if self.bdstoken:
-            params["bdstoken"] = self.bdstoken
 
-        data = {
-            "fsidlist": json.dumps(from_fs_ids),
-            "path": to_path,
-        }
-        if randsk:
-            params["sekey"] = unquote(randsk)
+        compact_fsidlist = json.dumps(from_fs_ids, separators=(",", ":"))
+        spaced_fsidlist = json.dumps(from_fs_ids)
+        share_referer = f"https://pan.baidu.com/share/init?surl={surl}"
+        page_referer = f"https://pan.baidu.com/s/1{surl}"
+        attempts = [
+            ("legacy", decoded_randsk, active_bdclnd, compact_fsidlist, None, True),
+            ("share_referer", decoded_randsk, active_bdclnd, compact_fsidlist, share_referer, True),
+            ("page_referer", decoded_randsk, active_bdclnd, compact_fsidlist, page_referer, True),
+            ("json_spaces", decoded_randsk, active_bdclnd, spaced_fsidlist, None, True),
+            ("no_bdstoken", decoded_randsk, active_bdclnd, compact_fsidlist, None, False),
+            ("no_sekey", "", active_bdclnd, compact_fsidlist, None, True),
+        ]
+        if original_randsk and original_randsk != decoded_randsk:
+            attempts.insert(
+                1,
+                ("original_sekey", original_randsk, active_bdclnd, compact_fsidlist, None, True),
+            )
+            attempts.append(
+                ("decoded_cookie", decoded_randsk, decoded_randsk, compact_fsidlist, None, True)
+            )
 
-        resp = self.session.post(url, params=params, data=data, timeout=15)
-        return resp.json()
+        seen = set()
+        last_result = None
+        for name, sekey, bdclnd, fsidlist, referer, include_bdstoken in attempts:
+            dedupe_key = (sekey, bdclnd, fsidlist, referer, include_bdstoken)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            params = dict(base_params)
+            if include_bdstoken and self.bdstoken:
+                params["bdstoken"] = self.bdstoken
+            if sekey:
+                params["sekey"] = sekey
+
+            headers = {
+                "Origin": self.BASE,
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": referer or "https://pan.baidu.com/disk/home",
+            }
+            if bdclnd:
+                headers["Cookie"] = self._cookie_header(overriding_bdclnd=bdclnd)
+
+            data = {"fsidlist": fsidlist, "path": to_path}
+            try:
+                resp = self.session.post(
+                    url, params=params, data=data, headers=headers, timeout=15
+                )
+                result = resp.json()
+            except Exception as e:
+                logger.debug(f" transfer_share_files attempt={name} failed: {e}")
+                last_result = {"errno": -1, "errmsg": str(e)}
+                continue
+
+            errno = result.get("errno")
+            logger.debug(
+                f" transfer_share_files attempt={name} errno={errno} "
+                f"fsid_count={len(from_fs_ids)} to_path={to_path}"
+            )
+            if errno == 0:
+                return result
+            last_result = result
+
+        return last_result or {"errno": -1, "errmsg": "转存请求失败"}
+
+    def _cookie_header(self, overriding_bdclnd: str = "") -> str:
+        parts = []
+        bdclnd_seen = False
+        for cookie in self.session.cookies:
+            if cookie.name == "BDCLND":
+                bdclnd_seen = True
+                if overriding_bdclnd:
+                    parts.append(f"BDCLND={overriding_bdclnd}")
+                else:
+                    parts.append(f"{cookie.name}={cookie.value}")
+            else:
+                parts.append(f"{cookie.name}={cookie.value}")
+        if overriding_bdclnd and not bdclnd_seen:
+            parts.append(f"BDCLND={overriding_bdclnd}")
+        return "; ".join(parts)
 
     # ─── locatedownload（高速下载） ─────────────────────────────
 

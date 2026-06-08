@@ -22,7 +22,7 @@ class SettingsTab(QWidget):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 24, 40, 24)
+        layout.setContentsMargins(28, 22, 28, 22)
         layout.setSpacing(16)
 
         # ── 下载设置 ──
@@ -31,7 +31,7 @@ class SettingsTab(QWidget):
         dl_layout.setHorizontalSpacing(14)
         dl_layout.setVerticalSpacing(14)
         dl_layout.setContentsMargins(18, 26, 18, 18)
-        dl_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        dl_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         # 下载目录
         dir_layout = QHBoxLayout()

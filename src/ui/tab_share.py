@@ -4,7 +4,6 @@
 import os
 import re
 import time
-import uuid
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QGroupBox, QTreeWidget, QTreeWidgetItem,
@@ -20,6 +19,7 @@ from .utils import (
 from ..core.logger import get_logger
 
 logger = get_logger()
+TRANSFER_DOWNLOAD_DIR = "/PDM_Transfer_Temp"
 
 
 class ShareParseWorker(QThread):
@@ -104,17 +104,28 @@ class TransferDownloadWorker(QThread):
             fs_ids = [f[0] for f in self.files_info]
 
             # Step 0: 创建临时转存目录
-            self.progress.emit("正在创建临时目录...", False)
-            current = ""
-            for part in [p for p in self.to_path.split("/") if p]:
-                current += f"/{part}"
-                self.api.create_dir(current)
+            self.progress.emit("正在准备转存临时目录...", False)
+            self._reset_transfer_dir()
 
             # Step 1: 转存
-            self.progress.emit(f"正在转存 {len(fs_ids)} 个文件...", False)
-            transfer_result = self.api.transfer_share_files(
-                self.surl, fs_ids, self.to_path, self.randsk
-            )
+            transfer_result = {}
+            for attempt in range(1, 4):
+                suffix = "" if attempt == 1 else f"（第 {attempt} 次）"
+                self.progress.emit(f"正在转存 {len(fs_ids)} 个文件{suffix}...", False)
+                transfer_result = self.api.transfer_share_files(
+                    self.surl, fs_ids, self.to_path, self.randsk
+                )
+                if transfer_result.get("errno") == 0:
+                    break
+                if transfer_result.get("errno") == 2 and attempt < 3:
+                    delay = attempt * 2
+                    self.progress.emit(
+                        f"转存目录暂时未就绪，{delay} 秒后重试...", False
+                    )
+                    time.sleep(delay)
+                    self._reset_transfer_dir()
+                    continue
+                break
             if transfer_result.get("errno") != 0:
                 errmsg = transfer_result.get("errmsg", str(transfer_result.get("errno", "")))
                 self.progress.emit(f"转存失败: {errmsg}", True)
@@ -152,6 +163,24 @@ class TransferDownloadWorker(QThread):
         except Exception as e:
             self.progress.emit(f"错误: {e}", True)
             self.result.emit([])
+
+    def _reset_transfer_dir(self):
+        self.api.delete_files([self.to_path], onnest="ignore")
+        time.sleep(0.5)
+        last_error = None
+        for attempt in range(1, 4):
+            result = self.api.create_dir(self.to_path)
+            errno = result.get("errno", 0)
+            if errno == 0:
+                return
+            last_error = result
+            if errno in (2, -8) and attempt < 3:
+                self.api.delete_files([self.to_path], onnest="ignore")
+                time.sleep(attempt * 2)
+                continue
+            break
+        errmsg = (last_error or {}).get("errmsg", str((last_error or {}).get("errno", "")))
+        raise RuntimeError(f"临时目录创建失败: {errmsg}")
 
 
 class CleanupTransferWorker(QThread):
@@ -585,9 +614,13 @@ class ShareParseTab(QWidget):
             self.lbl_status.setStyleSheet("color: #EF4444;")
             return
 
-        # 转存到唯一临时目录，避免误删用户自己的同名目录
-        job_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        transfer_path = f"/__pdm_tmp__/{job_id}"
+        if self._current_transfer_root or self._cleanup_jobs:
+            self.lbl_status.setText("已有转存下载任务尚未结束或清理，请稍后再试")
+            self.lbl_status.setStyleSheet("color: #F59E0B;")
+            return
+
+        job_id = "transfer"
+        transfer_path = TRANSFER_DOWNLOAD_DIR
 
         self.btn_save_to.setEnabled(False)
         self.btn_transfer.setEnabled(False)
